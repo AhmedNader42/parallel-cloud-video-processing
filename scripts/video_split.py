@@ -2,62 +2,51 @@ import boto3
 import botocore
 import os
 from pathlib import Path
-from moviepy.editor import VideoFileClip
 import argparse
+import threading
+import math
+
+# Create S3 client
+s3_client = boto3.client("s3")
 
 
-def download_video_segment_from_s3(
-    bucket_name, s3_key, local_path, duration_seconds=10
-):
-    """
-    Download a specific duration of a video file from S3 to a local path
-
-    Parameters:
-    bucket_name (str): Name of the S3 bucket
-    s3_key (str): Path to the video file in S3
-    local_path (str): Local path where the video should be saved
-    duration_seconds (int): Duration in seconds to download (default: 10)
-
-    Returns:
-    bool: True if download was successful, False otherwise
-    """
-    # Create S3 client
-    s3_client = boto3.client("s3")
-
-    # Create directory if it doesn't exist
-    Path(os.path.dirname(local_path)).mkdir(parents=True, exist_ok=True)
-
-    try:
-        file_size_response = s3_client.head_object(Bucket=bucket_name, Key=s3_key)
-        print(file_size_response["ContentLength"])
-
-        # Start with an initial chunk (5MB) to analyze video properties
-        initial_bytes = 5 * 1024 * 1024  # 5MB
-
-        # # Get object with range using get_object instead of download_file
-        print("Downloading initial chunk for analysis...")
-        response = s3_client.get_object(
-            Bucket=bucket_name, Key=s3_key, Range=f"bytes=0-{initial_bytes-1}"
+def assign_worker_ranges_fair(no_of_workers, per_worker_bytes):
+    worker_ranges = [{"start_bytes": 0, "end_bytes": per_worker_bytes}]
+    for i in range(1, no_of_workers):
+        worker_ranges.append(
+            {
+                "start_bytes": worker_ranges[i - 1]["end_bytes"],
+                "end_bytes": (i + 1) * per_worker_bytes,
+            }
         )
 
-        disk_filename = ""
-        if ".mp4" in local_path:
-            disk_filename = local_path
-        else:
-            disk_filename = local_path + "chunk.mp4"
+        print(
+            "Worker "
+            + str(i)
+            + " assigned ranges "
+            + str(worker_ranges[i - 1]["end_bytes"])
+            + " and ending at "
+            + str((i + 1) * per_worker_bytes)
+        )
 
-        print(disk_filename)
-        # Write the initial chunk to temporary file
-        with open(disk_filename, "wb") as f:
-            f.write(response["Body"].read())
+    print(worker_ranges)
+    return worker_ranges
 
-        # # Analyze video properties
-        # clip = VideoFileClip(temp_path)
-        # bitrate = os.path.getsize(temp_path) / clip.duration  # bytes per second
-        # clip.close()
 
-        # # Calculate required bytes for desired duration
-        # required_bytes = int(bitrate * duration_seconds)
+def get_video_chunk(range_start, range_end):
+    try:
+        print("bytes=" + str(math.floor(range_start)) + "-" + str(math.ceil(range_end)))
+        response = s3_client.get_object(
+            Bucket=bucket_name,
+            Key=s3_key,
+            Range="bytes="
+            + str(math.floor(range_start))
+            + "-"
+            + str(math.ceil(range_end)),
+        )
+        write_chunk_to_disk(
+            response=response, range_start=range_start, range_end=range_end
+        )
 
     except botocore.exceptions.ClientError as e:
         if e.response["Error"]["Code"] == "404":
@@ -69,6 +58,72 @@ def download_video_segment_from_s3(
     except Exception as e:
         print(f"An unexpected error occurred: {str(e)}")
         return False
+
+
+def transform_video_threaded(worker_ranges):
+    threads = []
+
+    for each in worker_ranges:
+        t = threading.Thread(
+            target=get_video_chunk,
+            args=(each["start_bytes"], each["end_bytes"]),
+        )
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join()
+        print(t)
+
+
+def write_chunk_to_disk(response, range_start, range_end):
+    range_start = range_start // 1024
+    range_end = range_end // 1024
+
+    disk_filename = (
+        local_path + str(int(range_start)) + "to" + str(int(range_end)) + ".mp4"
+    )
+    print("Writing file at specified path: " + disk_filename)
+    print(response)
+
+    # Write the initial chunk to temporary file
+    with open(disk_filename, "wb") as f:
+        f.write(response["Body"].read())
+
+    # if ".mp4" in local_path:
+    #     disk_filename = local_path
+    # else:
+
+
+def download_video_segment_from_s3(bucket_name, s3_key, local_path, no_of_workers=10):
+    """
+    Download a specific duration of a video file from S3 to a local path
+
+    Parameters:
+    bucket_name (str): Name of the S3 bucket
+    s3_key (str): Path to the video file in S3
+    local_path (str): Local path where the video should be saved
+
+    Returns:
+    bool: True if download was successful, False otherwise
+    """
+    # Create directory if it doesn't exist
+    Path(os.path.dirname(local_path)).mkdir(parents=True, exist_ok=True)
+
+    file_size_response = s3_client.head_object(Bucket=bucket_name, Key=s3_key)
+    file_size_bytes = file_size_response["ContentLength"]
+
+    print("Total file size : " + str(file_size_bytes))
+    print("Splitting the file among " + str(no_of_workers) + " workers")
+    per_worker_bytes = file_size_bytes / no_of_workers
+
+    print("Each worker will process " + str(per_worker_bytes) + " bytes of data")
+    worker_ranges = assign_worker_ranges_fair(no_of_workers, per_worker_bytes)
+    worker_ranges = [worker_ranges[1]]
+
+    transform_video_threaded(worker_ranges=worker_ranges)
+    # # Get object with range using get_object instead of download_file
+    print("Downloading initial chunk for analysis...")
 
 
 if __name__ == "__main__":
